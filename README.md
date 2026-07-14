@@ -1,50 +1,32 @@
-# Redox OS installer
+# eos-installer
 
-The Redox installer will allow you to produce a Redox OS image. You will
-be able to specify:
-- Output device (raw image, ISO, QEMU, VirtualBox, drive)
-- Filesystem
-- Included packages
-- Method of installation (from source, from binary)
-- User accounts
+**E-OS fork of [`redox-os/installer`](https://gitlab.redox-os.org/redox-os/installer).** Part of the [**E-OS**](https://github.com/Gh0s777tt/E-OS) ecosystem — a hardened, Crimson-branded downstream of [Redox OS](https://www.redox-os.org).
 
-You will be prompted to install dependencies, based on your OS and method of
-installation. The easiest method is to install from binaries.
+This repository is the **Redox OS installer**.
 
-## Usage
+## E-OS changes vs upstream
 
-It is recommended to compile with `cargo`, in release mode:
-```bash
-cargo build --release
-```
+_None yet_ — pinned to a clean upstream commit. E-OS branding and config for this component are applied via **recipe patches in the [main repo](https://github.com/Gh0s777tt/E-OS)**, not fork commits.
 
-By default, you will be prompted to supply configuration options. You can
-use the scripted mode by supplying a configuration file:
-```bash
-cargo run --release -- config/example.toml
-```
-An example configuration can be found in [config/example.toml](./config/example.toml).
-Unsuplied configuration will use the default. You can use the `general.prompt`
-setting to prompt when configuration is not set. Multiple configurations can
-be specified, they will be built in order.
+## How it's pinned
 
-## Embedding
+The E-OS build pins this fork in [`recipes/core/installer/recipe.toml`](https://github.com/Gh0s777tt/E-OS/blob/main/recipes/core/installer/recipe.toml):
 
-The installer can also be used inside of other crates, as a library:
+- branch **`master`** · rev **`05bf2eb42956`**
+- up to date with upstream
 
-```toml
-# Cargo.toml
-[dependencies]
-redox_installer = "0.1"
-```
+## Build standalone
 
-```rust
-// src/main.rs
-extern crate redox_installer;
+This fork is normally built by the E-OS cookbook (`make CI=1 …` in the [main repo](https://github.com/Gh0s777tt/E-OS)). To build it on its own you need the Redox toolchain; see the main repo's [build guide](https://github.com/Gh0s777tt/E-OS/blob/main/docs/building.md).
 
-fn main() {    
-    let mut config = redox_installer::Config::default();
-    ...
-    redox_installer::install(config);
-}
-```
+## Hosting
+
+**GitLab (source of truth):** https://gitlab.com/e-os/eos-installer  
+**GitHub (read-only mirror):** https://github.com/Gh0s777tt/eos-installer
+
+## License
+
+MIT (inherited from upstream Redox). The E-OS project as a whole is AGPL-3.0; see the [main repo](https://github.com/Gh0s777tt/E-OS/blob/main/LICENSE).
+
+---
+[E-OS main repo](https://github.com/Gh0s777tt/E-OS) · [Docs](https://github.com/Gh0s777tt/E-OS/tree/main/docs) · [Upstream](https://gitlab.redox-os.org/redox-os/installer)
