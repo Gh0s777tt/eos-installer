@@ -27,6 +27,9 @@ cargo-test:
 
 gui-build:
   stage: test
+  # E-OS: this job had no image, so it ran on the runner default (no cargo) and
+  # always failed; redoxer build needs the redoxer image anyway.
+  image: "redoxos/redoxer:latest"
   script:
     - apt update && apt install -y fuse3 libfuse3-dev
     - cd gui
