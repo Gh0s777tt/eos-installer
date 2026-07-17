@@ -56,24 +56,21 @@ fn build_id_from_repo_toml(repo_toml: &str) -> Option<String> {
         })
 }
 
-fn local_repo_build_id(cookbook: &str) -> Option<String> {
+fn local_repo_build_id(cookbook: &str, target: &str) -> Option<String> {
     let repo_toml = Path::new(cookbook)
         .join("repo")
-        .join(redox_installer::get_target())
+        .join(target)
         .join("repo.toml");
     let repo_toml = fs::read_to_string(repo_toml).ok()?;
     build_id_from_repo_toml(&repo_toml)
 }
 
-fn remote_repo_build_id() -> Option<String> {
+fn remote_repo_build_id(target: &str) -> Option<String> {
     let callback = Rc::new(RefCell::new(pkg::callback::SilentCallback::new()));
     let download_backend = pkg::net_backend::DefaultNetBackend::new().ok()?;
     let mut repo = pkg::RepoManager::new(callback, Box::new(download_backend));
-    repo.add_remote(
-        "https://static.redox-os.org/pkg",
-        &redox_installer::get_target(),
-    )
-    .ok()?;
+    repo.add_remote("https://static.redox-os.org/pkg", target)
+        .ok()?;
 
     let package = pkg::PackageName::new("repo").ok()?;
     let (repo_toml, _) = repo.get_package_toml(&package).ok()?;
@@ -182,10 +179,11 @@ fn main() {
             None
         };
 
+        let target = redox_installer::get_target_with(config.general.target.as_deref());
         let build_id = if let Some(cookbook) = cookbook.as_deref() {
-            local_repo_build_id(cookbook)
+            local_repo_build_id(cookbook, &target)
         } else {
-            remote_repo_build_id()
+            remote_repo_build_id(&target)
         };
         append_os_release_metadata(
             &mut config,

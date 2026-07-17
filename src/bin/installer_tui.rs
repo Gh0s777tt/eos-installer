@@ -299,6 +299,9 @@ fn main() {
         password_opt: password_opt.as_ref().map(|x| x.as_bytes()),
         efi_partition_size: None,
         skip_partitions: false, // TODO?
+        // In-image install: the compile-time TARGET baked into this binary
+        // matches the running system's arch.
+        target: redox_installer::get_target(),
     };
     let res = with_whole_disk(&disk_path, &disk_option, |mut fs| {
         // Fast install method via filesystem clone

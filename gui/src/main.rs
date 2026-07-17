@@ -244,6 +244,9 @@ fn install<F: FnMut(Message)>(disk_path: String, password_opt: Option<String>, m
         password_opt: password_opt.as_ref().map(|x| x.as_bytes()),
         efi_partition_size: None,
         skip_partitions: false,
+        // In-image install: the compile-time TARGET baked into this binary
+        // matches the running system's arch.
+        target: redox_installer::get_target(),
     };
     let res = with_whole_disk(&disk_path, &disk_option, |mut fs| -> anyhow::Result<()> {
         // Fast install method via filesystem clone

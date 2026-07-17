@@ -31,13 +31,35 @@ pub struct DiskOption<'a> {
     pub password_opt: Option<&'a [u8]>,
     pub efi_partition_size: Option<u32>, //MiB
     pub skip_partitions: bool,
+    /// Target triple the disk is prepared for; decides the EFI boot file name.
+    pub target: String,
 }
 
+/// Resolve the target triple without a filesystem config: the TARGET
+/// environment variable, then the compile-time TARGET, then the historical
+/// x86_64 default. Prefer [`get_target_with`] whenever a config is at hand.
 pub fn get_target() -> String {
-    // TODO: Configurable from filesystem config?
-    env::var("TARGET").unwrap_or(
-        option_env!("TARGET").map_or("x86_64-unknown-redox".to_string(), |x| x.to_string()),
-    )
+    get_target_with(None)
+}
+
+/// Resolve the target triple. Precedence: the TARGET environment variable
+/// (explicit, set by the build system) > the filesystem config
+/// (`[general] target`) > the compile-time TARGET baked into this binary >
+/// the historical x86_64 default. A wrong target writes the wrong EFI boot
+/// file name (e.g. BOOTX64.EFI on an aarch64 disk boots to the EFI shell),
+/// so the fallback to the bare default is warned.
+pub fn get_target_with(config_target: Option<&str>) -> String {
+    env::var("TARGET")
+        .ok()
+        .or_else(|| config_target.map(str::to_string))
+        .or_else(|| option_env!("TARGET").map(str::to_string))
+        .unwrap_or_else(|| {
+            eprintln!(
+                "installer: no TARGET in the environment, the config ([general] target) \
+                 or at compile time; defaulting to x86_64-unknown-redox"
+            );
+            "x86_64-unknown-redox".to_string()
+        })
 }
 
 /// Converts a password to a serialized argon2rs hash, understandable
@@ -90,7 +112,7 @@ pub fn prompt_password(prompt: &str, confirm_prompt: &str) -> Result<Option<Stri
 }
 
 fn install_packages(config: &Config, dest: &Path, cookbook: Option<&str>) -> anyhow::Result<()> {
-    let target = &get_target();
+    let target = &get_target_with(config.general.target.as_deref());
 
     let packages: Vec<&String> = config
         .packages
@@ -531,7 +553,7 @@ where
     P: AsRef<Path>,
     F: FnOnce(FileSystem<DiskIo<fscommon::StreamSlice<DiskWrapper>>>) -> Result<T>,
 {
-    let target = get_target();
+    let target = &disk_option.target;
 
     let bootloader_efi_name = match target.as_str() {
         "aarch64-unknown-redox" => "BOOTAA64.EFI",
@@ -835,6 +857,7 @@ fn install_inner(config: Config, output: &Path) -> Result<()> {
             password_opt: password_opt,
             efi_partition_size: config.general.efi_partition_size,
             skip_partitions: config.general.skip_partitions.unwrap_or(false),
+            target: get_target_with(config.general.target.as_deref()),
         };
         with_whole_disk(output, &disk_option, move |fs| {
             if config.general.no_mount.unwrap_or(false) {

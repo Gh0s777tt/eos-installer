@@ -19,6 +19,10 @@ pub struct GeneralConfig {
     /// Use AR to write files instead of FUSE-based mount
     /// (bypasses FUSE, but slower and requires namespaced context such as "podman unshare")
     pub no_mount: Option<bool>,
+    /// Target triple this filesystem is built for (e.g. "aarch64-unknown-redox").
+    /// Decides the EFI boot file name (BOOTAA64.EFI vs BOOTX64.EFI) and repo
+    /// paths. The TARGET environment variable, when set, still wins.
+    pub target: Option<String>,
 }
 
 impl GeneralConfig {
@@ -38,5 +42,8 @@ impl GeneralConfig {
             self.write_bootloader = Some(write_bootloader);
         }
         self.no_mount = other.no_mount.or(self.no_mount);
+        if let Some(target) = other.target {
+            self.target = Some(target);
+        }
     }
 }
