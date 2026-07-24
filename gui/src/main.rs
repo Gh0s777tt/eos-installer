@@ -180,7 +180,12 @@ fn package_files(
     Ok(())
 }
 
-fn install<F: FnMut(Message)>(disk_path: String, password_opt: Option<String>, mut f: F) {
+fn install<F: FnMut(Message)>(
+    disk_path: String,
+    password_opt: Option<String>,
+    net_cfg: NetCfg,
+    mut f: F,
+) {
     let start = std::time::Instant::now();
 
     let mut progress = 0;
@@ -265,7 +270,14 @@ fn install<F: FnMut(Message)>(disk_path: String, password_opt: Option<String>, m
         })? {
             progress = 100;
             message!("Finished installing using fast mode");
-            return Ok(());
+            // The fast path returns before any Config is applied, so the network
+            // settings have to be written into the cloned root explicitly —
+            // otherwise the pane would be silently ignored on the common
+            // live-ISO install.
+            message!("Applying network settings");
+            return with_redoxfs_mount(fs, None, |mount_path: &Path| -> anyhow::Result<()> {
+                net_cfg.write_into(mount_path)
+            });
         }
 
         with_redoxfs_mount(fs, None, |mount_path: &Path| -> anyhow::Result<()> {
@@ -319,6 +331,11 @@ fn install<F: FnMut(Message)>(disk_path: String, password_opt: Option<String>, m
                 copy_file(&src, &dest, &mut buf)?;
             }
 
+            // After install_dir and the package copy, so neither overwrites the
+            // user's choice with the image's baked-in defaults.
+            message!("Applying network settings");
+            net_cfg.write_into(mount_path)?;
+
             progress = 100;
             message!("Finished installing, unmounting filesystem");
             Ok(())
@@ -342,14 +359,82 @@ fn install<F: FnMut(Message)>(disk_path: String, password_opt: Option<String>, m
 enum Page {
     Sudo(String),
     Disk(Option<usize>),
+    Network(NetCfg),
     Install(usize, String),
     Success(String),
     Error(String),
 }
 
+/// Network settings collected by the installer and written into the installed
+/// system's `/etc/net/*`.
+///
+/// E-OS applies these on the first boot of the new system: `11_eos-netcfg.service`
+/// runs `eos-netcfg boot`, which for `static` pushes the files onto the live
+/// netcfg stack and for `dhcp` waits for the lease and mirrors it back into the
+/// files. So what is chosen here is what the installed machine actually comes up
+/// with — previously the installer copied the image's baked-in defaults and the
+/// user had no say at all.
+#[derive(Clone, Debug)]
+struct NetCfg {
+    dhcp: bool,
+    ip: String,
+    subnet: String,
+    router: String,
+    dns: String,
+}
+
+impl NetCfg {
+    /// Pre-fill from the *running* (live/installer) system, so the form starts
+    /// from values that already work on this machine rather than from blanks.
+    fn from_live() -> Self {
+        let read = |p: &str| {
+            fs::read_to_string(p)
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+        let mut cfg = NetCfg {
+            // The live medium is DHCP-configured by `10_dhcpd.service`, and DHCP is
+            // the right default for a fresh install.
+            dhcp: true,
+            ip: read("/etc/net/ip"),
+            subnet: read("/etc/net/ip_subnet"),
+            router: read("/etc/net/ip_router"),
+            dns: read("/etc/net/dns"),
+        };
+        if cfg.subnet.is_empty() {
+            cfg.subnet = "255.255.255.0".to_string();
+        }
+        cfg
+    }
+
+    /// Write the settings into the freshly installed root at `mount_path`.
+    ///
+    /// Called on **both** install paths — the config path and the fast clone —
+    /// because the fast path returns before any `Config` is applied, so a pane
+    /// that only pushed `config.files` would be silently ignored on a live-ISO
+    /// install (the normal case).
+    fn write_into(&self, mount_path: &Path) -> anyhow::Result<()> {
+        let dir = mount_path.join("etc/net");
+        fs::create_dir_all(&dir)?;
+        if self.dhcp {
+            // Leave the address files as installed; the mode marker tells the new
+            // system to lease on boot and mirror the result into them.
+            fs::write(dir.join("mode"), "dhcp\n")?;
+        } else {
+            fs::write(dir.join("mode"), "static\n")?;
+            fs::write(dir.join("ip"), format!("{}\n", self.ip))?;
+            fs::write(dir.join("ip_subnet"), format!("{}\n", self.subnet))?;
+            fs::write(dir.join("ip_router"), format!("{}\n", self.router))?;
+            fs::write(dir.join("dns"), format!("{}\n", self.dns))?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Worker {
-    command_sender: std::sync::mpsc::Sender<(String, Option<String>)>,
+    command_sender: std::sync::mpsc::Sender<(String, Option<String>, NetCfg)>,
     join_handle: Arc<std::thread::JoinHandle<()>>,
 }
 
@@ -361,6 +446,12 @@ enum Message {
     SudoSubmit,
     DiskChoose(usize),
     DiskConfirm(usize),
+    NetDhcp(bool),
+    NetIp(String),
+    NetSubnet(String),
+    NetRouter(String),
+    NetDns(String),
+    NetConfirm,
     Install(usize, String),
     Success(String),
     Exit,
@@ -371,6 +462,8 @@ struct Window {
     core: Core,
     page: Page,
     disk_paths: Vec<(String, bool, u64)>,
+    /// Disk chosen on the Disk page, remembered across the Network page.
+    disk_i: Option<usize>,
     worker_opt: Option<Worker>,
 }
 
@@ -393,9 +486,11 @@ impl Window {
 
                         //TODO: kill worker thread?
                         let join_handle = std::thread::spawn(move || {
-                            while let Ok((disk_path, password_opt)) = command_receiver.recv() {
+                            while let Ok((disk_path, password_opt, net_cfg)) =
+                                command_receiver.recv()
+                            {
                                 println!("Installing to {:?}", disk_path);
-                                install(disk_path, password_opt, |message| {
+                                install(disk_path, password_opt, net_cfg, |message| {
                                     message_sender.unbounded_send(message).unwrap();
                                 });
                             }
@@ -441,6 +536,7 @@ impl Application for Window {
             core,
             page,
             disk_paths,
+            disk_i: None,
             worker_opt: None,
         };
         let task = app.set_window_title("Redox OS Installer".to_string());
@@ -491,9 +587,47 @@ impl Application for Window {
             Message::DiskChoose(disk_i) => {
                 self.page = Page::Disk(Some(disk_i));
             }
-            Message::DiskConfirm(disk_i) => match self.disk_paths.get(disk_i) {
+            // Disk is chosen — collect the network settings before installing.
+            Message::DiskConfirm(disk_i) => {
+                self.disk_i = Some(disk_i);
+                self.page = Page::Network(NetCfg::from_live());
+            }
+            Message::NetDhcp(dhcp) => {
+                if let Page::Network(cfg) = &mut self.page {
+                    cfg.dhcp = dhcp;
+                }
+            }
+            Message::NetIp(v) => {
+                if let Page::Network(cfg) = &mut self.page {
+                    cfg.ip = v;
+                }
+            }
+            Message::NetSubnet(v) => {
+                if let Page::Network(cfg) = &mut self.page {
+                    cfg.subnet = v;
+                }
+            }
+            Message::NetRouter(v) => {
+                if let Page::Network(cfg) = &mut self.page {
+                    cfg.router = v;
+                }
+            }
+            Message::NetDns(v) => {
+                if let Page::Network(cfg) = &mut self.page {
+                    cfg.dns = v;
+                }
+            }
+            // Network settings accepted — hand disk + net to the worker.
+            Message::NetConfirm => match self.disk_i.and_then(|i| self.disk_paths.get(i)) {
                 Some((disk_path, _is_partition, _disk_size)) => match &self.worker_opt {
-                    Some(worker) => match worker.command_sender.send((disk_path.clone(), None)) {
+                    Some(worker) => match worker.command_sender.send((
+                        disk_path.clone(),
+                        None,
+                        match &self.page {
+                            Page::Network(cfg) => cfg.clone(),
+                            _ => NetCfg::from_live(),
+                        },
+                    )) {
                         Ok(()) => self.page = Page::Install(0, format!("Starting install...")),
                         Err(err) => {
                             self.page = Page::Error(format!("failed to send command: {}", err));
@@ -504,7 +638,7 @@ impl Application for Window {
                     }
                 },
                 None => {
-                    self.page = Page::Error(format!("invalid disk number {} chosen", disk_i));
+                    self.page = Page::Error("no disk chosen".to_string());
                 }
             },
             Message::Install(progress, description) => {
@@ -601,6 +735,69 @@ impl Application for Window {
                     // TODO: expose disk.pci-*-*nvme/* */ scheme to user
                     widgets.push(text("(try to rerun with sudo)").into());
                 }
+            }
+            Page::Network(cfg) => {
+                widgets.push(text("Network configuration:").size(24).into());
+                widgets.push(
+                    radio(
+                        text("Automatic (DHCP)"),
+                        true,
+                        Some(cfg.dhcp),
+                        Message::NetDhcp,
+                    )
+                    .into(),
+                );
+                widgets.push(
+                    radio(text("Static address"), false, Some(cfg.dhcp), Message::NetDhcp).into(),
+                );
+                if cfg.dhcp {
+                    widgets.push(
+                        text("The installed system will lease its address on boot.").into(),
+                    );
+                } else {
+                    // Only shown for static, so the fields can never look editable
+                    // while DHCP is selected.
+                    widgets.push(
+                        row![
+                            text("IP address"),
+                            space::horizontal(),
+                            text_input("10.0.2.15", &cfg.ip).on_input(Message::NetIp),
+                        ]
+                        .into(),
+                    );
+                    widgets.push(
+                        row![
+                            text("Subnet mask"),
+                            space::horizontal(),
+                            text_input("255.255.255.0", &cfg.subnet).on_input(Message::NetSubnet),
+                        ]
+                        .into(),
+                    );
+                    widgets.push(
+                        row![
+                            text("Gateway"),
+                            space::horizontal(),
+                            text_input("10.0.2.2", &cfg.router).on_input(Message::NetRouter),
+                        ]
+                        .into(),
+                    );
+                    widgets.push(
+                        row![
+                            text("DNS server"),
+                            space::horizontal(),
+                            text_input("9.9.9.9", &cfg.dns).on_input(Message::NetDns),
+                        ]
+                        .into(),
+                    );
+                }
+                widgets.push(space::vertical().into());
+                widgets.push(
+                    row![
+                        space::horizontal(),
+                        button::suggested("Install").on_press(Message::NetConfirm),
+                    ]
+                    .into(),
+                );
             }
             Page::Install(progress, description) => {
                 widgets.push(text("Installation progress:").size(24).into());
