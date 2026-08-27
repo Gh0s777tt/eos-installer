@@ -70,5 +70,19 @@ installer = [
 fuse = ["redoxfs/fuse"]
 
 [patch.crates-io]
+# R-F19: without this, redox_installer links redoxfs FROM CRATES.IO, so the mount it
+# performs INSIDE ITS OWN PROCESS bypasses the E-OS fork entirely and no fix in the fork
+# can ever reach it. Both sides carry version 0.9.1, which is exactly what made the
+# divergence invisible to every gate that looks at recipes and pins.
+redoxfs = { git = "https://github.com/Gh0s777tt/eos-redoxfs.git", rev = "58824d70a0" }
+
+# Same defect, separately found by scripts/eos-fork-linkage.py: `redox-pkg` is the crate
+# (directory pkg-lib) that carries E-OS's manifest signature verification, R-703's client
+# half -- and the installer was linking upstream's copy from crates.io. Checked on the
+# built binary with the instrument controlled first (pkgar 11, redox_installer 7): all
+# four E-OS signature literals appeared 0 times. The installer is the component that
+# writes a fresh system to disk, so it is the last place that should verify packages with
+# someone else's code.
+redox-pkg = { git = "https://github.com/Gh0s777tt/eos-pkgutils.git", rev = "5978425ecd" }
 # https://github.com/briansmith/ring/issues/1999
 ring = { git = "https://gitlab.redox-os.org/redox-os/ring.git", branch = "redox-0.17.8" }

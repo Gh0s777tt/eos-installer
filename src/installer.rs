@@ -429,9 +429,28 @@ where
         }
     };
 
-    unmount_path(&mount_path.as_os_str().to_str().unwrap())?;
+    // R-F19: teardown must not decide the install's result. A bare `?` here reported a
+    // *successful* install as "failed to install", and worse, discarded `res` -- so a
+    // genuine install failure would have surfaced as this one instead.
+    let unmount_res = unmount_path(mount_path.as_os_str().to_str().unwrap());
 
-    join_handle.join().unwrap();
+    match unmount_res {
+        Ok(()) => {
+            join_handle.join().unwrap();
+        }
+        Err(err) => {
+            // The serve thread only leaves its loop once the unmount is honoured, so
+            // joining after a failed unmount deadlocks (measured in U-166). Skip the
+            // join and let `res` speak: `and` keeps the install's own error when there
+            // is one, and reports the teardown failure only when the install succeeded.
+            eprintln!(
+                "warning: unmounting {} failed: {}",
+                mount_path.display(),
+                err
+            );
+            return res.and(Err(err.into()));
+        }
+    }
 
     if cfg!(not(target_os = "redox")) {
         fs::remove_dir_all(&mount_path)?;
