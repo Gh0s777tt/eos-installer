@@ -773,17 +773,40 @@ pub fn try_fast_install<D: redoxfs::Disk, F: FnMut(u64, u64)>(
     use std::os::fd::AsRawFd;
     use syscall::PAGE_SIZE;
 
-    let phys = env::var("DISK_LIVE_ADDR")
-        .ok()
-        .and_then(|x| usize::from_str_radix(&x, 16).ok())
-        .unwrap_or(0);
-    let size = env::var("DISK_LIVE_SIZE")
-        .ok()
-        .and_then(|x| usize::from_str_radix(&x, 16).ok())
-        .unwrap_or(0);
+    // R-F24: the bootloader puts DISK_LIVE_ADDR / DISK_LIVE_SIZE in the KERNEL environment,
+    // which userspace reads through /scheme/sys/env -- exactly as lived does (eos-base,
+    // drivers/storage/lived/src/main.rs:115). They are NOT process environment variables,
+    // so env::var() never saw them and this function bailed out in its first three lines on
+    // every boot, live ones included. That left only the file-by-file path, measured at
+    // 31 files/min (0.101 MiB/s) under emulation -- about seven hours for 13679 files.
+    //
+    // Measured in a single run on a live-booted image, both sources side by side:
+    //     grep DISK_LIVE /scheme/sys/env  ->  DISK_LIVE_ADDR=00000000e4e50000
+    //                                         DISK_LIVE_SIZE=0000000057500000
+    //     echo "$DISK_LIVE_ADDR"          ->  Variable "DISK_LIVE_ADDR" does not exist
+    //
+    // The process environment is still honoured first, so an explicit override keeps working.
+    fn kernel_env_hex(name: &str) -> Option<usize> {
+        let env = fs::read_to_string("/scheme/sys/env").ok()?;
+        env.lines().find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == name).then(|| usize::from_str_radix(value.trim(), 16).ok())?
+        })
+    }
+    fn live_value(name: &str) -> usize {
+        env::var(name)
+            .ok()
+            .and_then(|x| usize::from_str_radix(&x, 16).ok())
+            .or_else(|| kernel_env_hex(name))
+            .unwrap_or(0)
+    }
+
+    let phys = live_value("DISK_LIVE_ADDR");
+    let size = live_value("DISK_LIVE_SIZE");
     if phys == 0 || size == 0 {
         return Ok(false);
     }
+    eprintln!("fast install: live disk at {phys:#x}, {size} bytes");
 
     let start = (phys / PAGE_SIZE) * PAGE_SIZE;
     let end = phys
