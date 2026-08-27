@@ -1,10 +1,9 @@
 use anyhow::{anyhow, bail, Result};
 use pkgar::{ext::EntryExt, PackageHead};
 use pkgar_core::PackageSrc;
-use pkgar_keys::PublicKeyFile;
+use pkg::{PackageState, PACKAGES_HEAD_DIR, PACKAGES_TOML_PATH};
 use redox_installer::{try_fast_install, with_redoxfs_mount, with_whole_disk, Config, DiskOption};
 use std::{
-    ffi::OsStr,
     fs,
     io::{self, Read, Write},
     os::unix::fs::{symlink, MetadataExt, OpenOptionsExt},
@@ -75,6 +74,19 @@ fn disk_paths(paths: &mut Vec<(PathBuf, u64)>) {
 }
 
 fn copy_file(src: &Path, dest: &Path, buf: &mut [u8]) -> Result<()> {
+    // R-F22: the config install runs BEFORE this copy, and it deliberately overrides some
+    // packaged files -- E-OS replaces /etc/issue with its own login banner, among 65
+    // [[files]] entries. Both branches below create with create_new/symlink semantics, so
+    // the first such overlap aborted the entire install with "File exists" -- measured at
+    // file 12 of 13679. The config layer is the customisation and has to win, so a
+    // destination that already exists is left alone instead of fought over.
+    //
+    // This code had never run before: package_files() failed with ENOENT ahead of it
+    // (R-F21), and that failure was itself masked by the unmount error (R-F19).
+    if fs::symlink_metadata(dest).is_ok() {
+        return Ok(());
+    }
+
     if let Some(parent) = dest.parent() {
         // Parent may be a symlink
         if !parent.is_symlink() {
@@ -166,27 +178,33 @@ fn package_files(
     //TODO: Remove packages from config where all files are located (and have valid shasum?)
     config.packages.clear();
 
-    let pkey_path = "pkg/id_ed25519.pub.toml";
-    let pkey = PublicKeyFile::open(&root_path.join(pkey_path))?.pkey;
-    files.push(pkey_path.to_string());
+    // R-F21: the package database moved, and this had not followed. It used to open
+    // <root>/pkg/id_ed25519.pub.toml and list <root>/pkg/*.pkgar_head. Measured on a live
+    // E-OS image: /pkg does not exist at all, while var/lib/packages holds 65 .pkgar_head
+    // files and etc/pkg/packages.toml is present. So this failed with ENOENT before
+    // copying anything -- and that failure was invisible until the unmount error stopped
+    // masking the callback's result (R-F19).
+    //
+    // This is a rewrite rather than a path swap because the key moved too: pkg-lib keeps
+    // one public key PER REMOTE in packages.toml, instead of a single file at a fixed path.
+    let state = PackageState::from_sysroot(root_path)
+        .map_err(|err| anyhow!("cannot read the package database: {err}"))?;
 
-    for item_res in fs::read_dir(&root_path.join("pkg"))? {
-        let item = item_res?;
-        let pkg_path = item.path();
-        if pkg_path.extension() == Some(OsStr::new("pkgar_head")) {
-            let mut pkg = PackageHead::new(&pkg_path, &root_path, &pkey)?;
-            for entry in pkg.read_entries()? {
-                files.push(entry.check_path()?.to_str().unwrap().to_string());
-            }
-            files.push(
-                pkg_path
-                    .strip_prefix(root_path)
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .to_string(),
+    files.push(PACKAGES_TOML_PATH.to_string());
+
+    for (package, install) in &state.installed {
+        let Some(remote) = state.pubkeys.get(&install.remote) else {
+            bail!(
+                "package {package} names remote {}, which has no public key in the package database",
+                install.remote
             );
+        };
+        let rel = format!("{PACKAGES_HEAD_DIR}/{package}.pkgar_head");
+        let mut pkg = PackageHead::new(&root_path.join(&rel), root_path, &remote.pkey)?;
+        for entry in pkg.read_entries()? {
+            files.push(entry.check_path()?.to_str().unwrap().to_string());
         }
+        files.push(rel);
     }
 
     Ok(())

@@ -83,6 +83,6 @@ redoxfs = { git = "https://github.com/Gh0s777tt/eos-redoxfs.git", rev = "58824d7
 # four E-OS signature literals appeared 0 times. The installer is the component that
 # writes a fresh system to disk, so it is the last place that should verify packages with
 # someone else's code.
-redox-pkg = { git = "https://github.com/Gh0s777tt/eos-pkgutils.git", rev = "5978425ecd" }
+redox-pkg = { git = "https://github.com/Gh0s777tt/eos-pkgutils.git", rev = "cf36a01b9b" }
 # https://github.com/briansmith/ring/issues/1999
 ring = { git = "https://gitlab.redox-os.org/redox-os/ring.git", branch = "redox-0.17.8" }

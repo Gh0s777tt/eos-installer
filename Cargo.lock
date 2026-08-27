@@ -1432,7 +1432,7 @@ checksum = "083c57139a99303d842a4cfe1f0fd6483d77d81eda1442be84bcb1a0f737ed96"
 [[package]]
 name = "redox-pkg"
 version = "0.3.1"
-source = "git+https://github.com/Gh0s777tt/eos-pkgutils.git?rev=5978425ecd#5978425ecdc01fa80c72ccfe722845f45e66b27b"
+source = "git+https://github.com/Gh0s777tt/eos-pkgutils.git?rev=cf36a01b9b#cf36a01b9bb4a7184001796632a28ec725b37adc"
 dependencies = [
  "ed25519-dalek",
  "futures-channel",
