@@ -19,13 +19,88 @@ enum Buffer<'a> {
     Write(&'a [u8]),
 }
 
+/// Logical block size of the target — asked of the device, not assumed.
+///
+/// WHY THIS EXISTS. This was `let block_size = 512;` with a TODO. `installer.rs` then does
+///
+///     let gpt_block_size = match block_size {
+///         512 => gpt::disk::LogicalBlockSize::Lb512,
+///         _ => bail!("block size {block_size} not supported"),
+///     };
+///
+/// Because the value was a constant, that `_` arm was unreachable: the guard could never
+/// fire. On a 4Kn drive the installer therefore did NOT refuse — it laid out GPT on the
+/// wrong sector size and produced a partition table the firmware cannot read. A check that
+/// can only pass is not a check; this is what makes that one able to fail.
+///
+/// WHERE EACH ANSWER COMES FROM:
+///
+/// * Redox — `st_blksize`, which the block driver fills in from the device itself
+///   (`drivers/storage/driver-block/src/lib.rs:538`: `stat.st_blksize = disk.block_size()`).
+///   This is the path that matters for a bare-metal install, because that install runs
+///   on Redox.
+/// * Linux, block device — `BLKSSZGET`. `st_blksize` is a preferred-I/O hint there, not the
+///   logical sector size GPT counts LBAs in, so it is the wrong number to trust.
+/// * Anything else, including every image FILE — 512. An image has no sector size of its
+///   own; the GPT written inside it is in 512-byte LBAs and the image is copied onto a
+///   device afterwards. This is also why the original TODO was right that `blksize()`
+///   "works on disks but not image files".
+#[cfg(target_os = "redox")]
+fn logical_block_size(_disk: &File, metadata: &std::fs::Metadata) -> Result<usize> {
+    use std::os::unix::fs::MetadataExt;
+    let blksize = metadata.blksize();
+    // A scheme that reports 0 has told us nothing; assuming 512 there would put us back
+    // where we started, so say so instead.
+    if blksize == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "device reported a logical block size of 0",
+        ));
+    }
+    Ok(blksize as usize)
+}
+
+#[cfg(target_os = "linux")]
+fn logical_block_size(disk: &File, metadata: &std::fs::Metadata) -> Result<usize> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileTypeExt;
+
+    if !metadata.file_type().is_block_device() {
+        return Ok(512);
+    }
+
+    // BLKSSZGET == _IO(0x12, 104): the LOGICAL sector size, which is the unit GPT LBAs are
+    // counted in. Deliberately not BLKPBSZGET (physical): a 512e drive reports 4096 physical
+    // and 512 logical, and GPT follows the logical one.
+    const BLKSSZGET: libc::c_ulong = 0x1268;
+    let mut sector_size: libc::c_int = 0;
+    let rc = unsafe { libc::ioctl(disk.as_raw_fd(), BLKSSZGET, &mut sector_size) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if sector_size <= 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("device reported a logical block size of {sector_size}"),
+        ));
+    }
+    Ok(sector_size as usize)
+}
+
+#[cfg(not(any(target_os = "redox", target_os = "linux")))]
+fn logical_block_size(_disk: &File, _metadata: &std::fs::Metadata) -> Result<usize> {
+    // macOS would need DKIOCGETBLOCKSIZE. Nothing installs to a raw device from macOS in
+    // this project -- the build runs in a Linux container and the install runs on Redox --
+    // so this is left as the image-file answer rather than guessed at.
+    Ok(512)
+}
+
 impl DiskWrapper {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let disk = OpenOptions::new().read(true).write(true).open(path)?;
         let metadata = disk.metadata()?;
         let size = metadata.len();
-        // TODO: get real block size: disk_metadata.blksize() works on disks but not image files
-        let block_size = 512;
+        let block_size = logical_block_size(&disk, &metadata)?;
         let block = vec![0u8; block_size].into_boxed_slice();
         Ok(Self {
             disk,
