@@ -1,0 +1,42 @@
+# E-OS ecosystem editor defaults. Keep this file identical across all eos-* repos.
+#
+# NOTE on line endings: `end_of_line = lf` below is the project default, but
+# `.gitattributes` is the single source of truth and pins CHANGELOG.md to CRLF.
+# An editor honouring only this file would rewrite that file to LF and break
+# ci-integrity.sh check 8, so the exception is stated explicitly at the bottom.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.rs]
+max_line_length = 100
+
+[*.{toml,yml,yaml,json}]
+indent_size = 2
+
+[*.{sh,bash}]
+indent_size = 2
+
+[*.py]
+indent_size = 4
+max_line_length = 100
+
+[*.md]
+# Two trailing spaces are a hard line break in Markdown; trimming them changes rendering.
+trim_trailing_whitespace = false
+
+[Makefile]
+indent_style = tab
+
+[*.mk]
+indent_style = tab
+
+# Pinned by .gitattributes — see the note at the top of this file.
+[CHANGELOG.md]
+end_of_line = crlf
