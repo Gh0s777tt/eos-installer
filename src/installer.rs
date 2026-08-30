@@ -586,6 +586,52 @@ fn gpt_logical_block_size(block_size: u64) -> Result<gpt::disk::LogicalBlockSize
     }
 }
 
+/// Write the EFI system partition and the bootloader into it.
+///
+/// Called LAST, after the root filesystem is in place -- see the comment at the call site.
+fn write_efi_partition(
+    disk_file: &mut DiskWrapper,
+    efi_start: u64,
+    efi_end: u64,
+    block_size: u64,
+    bootloader_efi_name: &str,
+    disk_option: &DiskOption,
+) -> Result<()> {
+    let disk_efi_start = efi_start * block_size;
+    let disk_efi_end = (efi_end + 1) * block_size;
+    let mut disk_efi =
+        fscommon::StreamSlice::new(&mut *disk_file, disk_efi_start, disk_efi_end)?;
+
+    eprintln!(
+        "Formatting EFI partition with size {:#x}",
+        disk_efi_end - disk_efi_start
+    );
+    fatfs::format_volume(&mut disk_efi, fatfs::FormatVolumeOptions::new())?;
+
+    eprintln!("Opening EFI partition");
+    let fs = fatfs::FileSystem::new(&mut disk_efi, fatfs::FsOptions::new())?;
+
+    eprintln!("Creating EFI directory");
+    let root_dir = fs.root_dir();
+    root_dir.create_dir("EFI")?;
+
+    eprintln!("Creating EFI/BOOT directory");
+    let efi_dir = root_dir.open_dir("EFI")?;
+    efi_dir.create_dir("BOOT")?;
+
+    eprintln!(
+        "Writing EFI/BOOT/{} file with size {:#x}",
+        bootloader_efi_name,
+        disk_option.bootloader_efi.len()
+    );
+    let boot_dir = efi_dir.open_dir("BOOT")?;
+    let mut file = boot_dir.create_file(bootloader_efi_name)?;
+    file.truncate()?;
+    file.write_all(&disk_option.bootloader_efi)?;
+
+    Ok(())
+}
+
 pub fn with_whole_disk<P, F, T>(disk_path: P, disk_option: &DiskOption, callback: F) -> Result<T>
 where
     P: AsRef<Path>,
@@ -720,41 +766,6 @@ where
         gpt_disk.write()?;
     }
 
-    // Format and install EFI partition
-    {
-        let disk_efi_start = efi_start * block_size;
-        let disk_efi_end = (efi_end + 1) * block_size;
-        let mut disk_efi =
-            fscommon::StreamSlice::new(&mut disk_file, disk_efi_start, disk_efi_end)?;
-
-        eprintln!(
-            "Formatting EFI partition with size {:#x}",
-            disk_efi_end - disk_efi_start
-        );
-        fatfs::format_volume(&mut disk_efi, fatfs::FormatVolumeOptions::new())?;
-
-        eprintln!("Opening EFI partition");
-        let fs = fatfs::FileSystem::new(&mut disk_efi, fatfs::FsOptions::new())?;
-
-        eprintln!("Creating EFI directory");
-        let root_dir = fs.root_dir();
-        root_dir.create_dir("EFI")?;
-
-        eprintln!("Creating EFI/BOOT directory");
-        let efi_dir = root_dir.open_dir("EFI")?;
-        efi_dir.create_dir("BOOT")?;
-
-        eprintln!(
-            "Writing EFI/BOOT/{} file with size {:#x}",
-            bootloader_efi_name,
-            disk_option.bootloader_efi.len()
-        );
-        let boot_dir = efi_dir.open_dir("BOOT")?;
-        let mut file = boot_dir.create_file(bootloader_efi_name)?;
-        file.truncate()?;
-        file.write_all(&disk_option.bootloader_efi)?;
-    }
-
     // Format and install RedoxFS partition
     eprintln!(
         "Installing to RedoxFS partition with size {:#x}",
@@ -765,7 +776,35 @@ where
         redoxfs_start * block_size,
         (redoxfs_end + 1) * block_size,
     )?);
-    with_redoxfs(disk_redoxfs, disk_option.password_opt, callback)
+    let result = with_redoxfs(disk_redoxfs, disk_option.password_opt, callback)?;
+
+    // R-612a: the ESP and the bootloader go LAST, after the root filesystem is complete.
+    //
+    // They used to be written first, which meant an install interrupted between them and the
+    // root left a disk the firmware happily boots into a loader that has no system behind it.
+    // Writing them last makes an interrupted install fail the way it should: the firmware
+    // finds no boot entry on this disk and falls through to the next device -- the USB stick
+    // it was started from -- so the operator can simply run the installer again.
+    //
+    // What this does NOT do, despite being easy to claim: preserve the previous operating
+    // system. The GPT is written before either partition can be filled, so the old partition
+    // table is gone long before this point. Ordering buys "obviously not installed" instead of
+    // "looks installed and is not". It does not buy "still boots what was there before", and
+    // no ordering of these writes can.
+    //
+    // The disk is reopened because `with_redoxfs` needs to own its slice (it hands the disk to
+    // a mount thread, hence `D: Disk + Send + 'static`), so `disk_file` is consumed above.
+    let mut disk_file = DiskWrapper::open(disk_path.as_ref())?;
+    write_efi_partition(
+        &mut disk_file,
+        efi_start,
+        efi_end,
+        block_size,
+        bootloader_efi_name,
+        disk_option,
+    )?;
+
+    Ok(result)
 }
 
 #[cfg(not(target_os = "redox"))]
