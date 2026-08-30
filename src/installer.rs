@@ -567,6 +567,25 @@ pub fn fetch_bootloaders(
 }
 
 //TODO: make bootloaders use Option, dynamically create BIOS and EFI partitions
+/// Map a device's logical block size onto the GPT crate's, refusing what we cannot lay out.
+///
+/// Extracted so it can be TESTED. Until `DiskWrapper::open` learned to ask the device
+/// (R-607a), `block_size` was the constant 512 and this refusal was unreachable code: on a
+/// 4Kn drive the installer did not stop, it computed GPT geometry on a sector size the drive
+/// does not have. Now the value can really be 4096, and `refuses_4kn_until_it_is_supported`
+/// below fails the build for anyone who deletes the guard instead of implementing it.
+///
+/// 4Kn is not merely unmapped here: `gpt_reserved` further down is `34 * 512`, and the
+/// partition offsets are computed in 512-byte units throughout. Supporting 4Kn means fixing
+/// that arithmetic too, which is why this refuses rather than pretending.
+fn gpt_logical_block_size(block_size: u64) -> Result<gpt::disk::LogicalBlockSize> {
+    match block_size {
+        512 => Ok(gpt::disk::LogicalBlockSize::Lb512),
+        // TODO: support (and test) other block sizes
+        _ => bail!("block size {block_size} not supported"),
+    }
+}
+
 /// Write the EFI system partition and the bootloader into it.
 ///
 /// Called LAST, after the root filesystem is in place -- see the comment at the call site.
@@ -647,13 +666,7 @@ where
         );
     }
 
-    let gpt_block_size = match block_size {
-        512 => gpt::disk::LogicalBlockSize::Lb512,
-        _ => {
-            // TODO: support (and test) other block sizes
-            bail!("block size {block_size} not supported");
-        }
-    };
+    let gpt_block_size = gpt_logical_block_size(block_size)?;
 
     // Calculate partition offsets
     let gpt_reserved = 34 * 512; // GPT always reserves 34 512-byte sectors
@@ -987,4 +1000,41 @@ fn format_bytes_inner(len: u64, divisor: u64, suffix: &'static str) -> String {
 
     let _ = write!(s, " {suffix}");
     s
+}
+
+
+#[cfg(test)]
+mod block_size_tests {
+    use super::*;
+
+    /// 512 is the only layout this installer can actually produce: `gpt_reserved` is
+    /// `34 * 512` and every partition offset below it is counted in 512-byte units.
+    #[test]
+    fn accepts_512() {
+        assert!(gpt_logical_block_size(512).is_ok());
+    }
+
+    /// The regression this exists for. Before R-607a `block_size` was a constant 512, so this
+    /// refusal could never run and a 4Kn drive got a GPT laid out on the wrong sector size.
+    /// If someone maps 4096 onto Lb4096 without also fixing the 512-byte arithmetic, this
+    /// test is what stops it.
+    #[test]
+    fn refuses_4kn_until_it_is_supported() {
+        let err = gpt_logical_block_size(4096).expect_err("4Kn must be refused, not laid out");
+        assert!(
+            err.to_string().contains("4096"),
+            "the refusal must name the size it refused, got: {err}"
+        );
+    }
+
+    /// A device answering with something absurd must be refused too, not rounded.
+    #[test]
+    fn refuses_nonsense_sizes() {
+        for n in [0u64, 1, 513, 1024, 8192] {
+            assert!(
+                gpt_logical_block_size(n).is_err(),
+                "block size {n} was accepted"
+            );
+        }
+    }
 }
