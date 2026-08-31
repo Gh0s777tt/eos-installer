@@ -210,52 +210,192 @@ fn package_files(
     Ok(())
 }
 
+/// What we can honestly say about whether a disk can be unplugged.
+///
+/// `Unknown` is a real answer and is printed as such. Redox exposes no removability flag on
+/// the disk scheme, so anything here is inferred from the INTERFACE, and an inference stated
+/// as a fact is how someone ends up erasing the wrong disk with confidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Removable {
+    Yes,
+    No,
+    Unknown,
+}
+
+impl Removable {
+    fn describe(self) -> &'static str {
+        match self {
+            Removable::Yes => "yes (inferred from the interface)",
+            Removable::No => "no (inferred from the interface)",
+            Removable::Unknown => "unknown -- Redox exposes no removability flag for this interface",
+        }
+    }
+}
+
+/// Interface and removability, derived from the disk scheme's directory name.
+///
+/// Measured shape of that name, from two real installer runs:
+///
+///     /scheme/disk.pci-0000-00-05.0-nvme/1
+///     /scheme/disk.pci-0000-00-06.0-nvme/1
+///
+/// Those two lines are the SAME 4 GB disk on two runs, at different PCI addresses -- which is
+/// exactly why the caller must not identify a disk by its position in a list. The trailing
+/// token after the last '-' names the driver, and that is all this function trusts.
+///
+/// Only `nvme` is backed by measurement here. Everything else returns the raw token and
+/// `Unknown`, because printing "SATA, not removable" for a string this code has never seen on a
+/// real machine would be inventing a fact at exactly the moment the user is deciding what to
+/// destroy.
+pub fn interface_of(scheme_dir: &str) -> (String, Removable) {
+    let token = scheme_dir.rsplit('-').next().unwrap_or("");
+    match token {
+        "nvme" => ("NVMe".to_string(), Removable::No),
+        "" => ("unknown".to_string(), Removable::Unknown),
+        other => (other.to_string(), Removable::Unknown),
+    }
+}
+
+/// The scheme directory of a disk path: `/scheme/disk.pci-…-nvme/1` -> `disk.pci-…-nvme`.
+pub fn scheme_dir_of(path: &Path) -> String {
+    path.parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Does what the operator typed name the disk they were shown?
+///
+/// Compared as an EXACT string after trimming -- not as a `Path`, and that distinction is the
+/// whole point. `Path` equality normalises: it was measured here that
+/// `Path::new("/scheme/disk…/1/") == Path::new("/scheme/disk…/1")` is TRUE, and it collapses
+/// `//` and `.` the same way. Normalisation the operator cannot see is exactly what must not
+/// happen in the one prompt whose answer erases a disk. "Type it exactly as shown" has to mean
+/// exactly.
+///
+/// On Redox the scheme path IS the identity, and two real runs produced
+/// `/scheme/disk.pci-0000-00-05.0-nvme/1` and `/scheme/disk.pci-0000-00-06.0-nvme/1` for
+/// different disks -- one character apart. Trimming is the only latitude given, because a
+/// trailing newline is the terminal's doing and not the operator's.
+pub fn confirms(typed: &str, path: &Path) -> bool {
+    let typed = typed.trim();
+    match path.to_str() {
+        Some(p) => !typed.is_empty() && typed == p,
+        // A path that is not valid UTF-8 cannot be retyped reliably, so refuse rather than
+        // fall back to a looser comparison.
+        None => false,
+    }
+}
+
 fn choose_disk() -> PathBuf {
     let mut paths = Vec::new();
     disk_paths(&mut paths);
+
+    if paths.is_empty() {
+        eprintln!("redox_installer_tui: no RedoxFS partition found");
+        eprintln!("redox_installer_tui: this tool is used to overwrite unmounted RedoxFS disk in Redox OS");
+        process::exit(1);
+    }
+
     loop {
-        for (i, (path, size)) in paths.iter().enumerate() {
-            eprintln!(
-                "\x1B[1m{}\x1B[0m: {}: {}",
-                i + 1,
-                path.display(),
-                redox_installer::format_bytes(*size)
-            );
+        eprintln!();
+        eprintln!("Disks found:");
+        for (path, size) in paths.iter() {
+            let (iface, removable) = interface_of(&scheme_dir_of(path));
+            eprintln!();
+            eprintln!("  \x1B[1m{}\x1B[0m", path.display());
+            eprintln!("      size:       {}", redox_installer::format_bytes(*size));
+            eprintln!("      interface:  {}", iface);
+            eprintln!("      removable:  {}", removable.describe());
+        }
+        eprintln!();
+        eprintln!("\x1B[1mEVERYTHING on the disk you name will be ERASED.\x1B[0m");
+        eprintln!("Type its full path exactly as shown above, or 'q' to quit.");
+        // Deliberately NOT a number. The list order follows PCI enumeration, which has already
+        // been observed to change between runs, so a number identifies a POSITION and not a
+        // device -- and the position is what moves.
+        eprint!("Disk to erase: ");
+
+        let mut line = String::new();
+        match io::stdin().read_line(&mut line) {
+            Ok(0) => {
+                eprintln!("redox_installer_tui: failed to read line: end of input");
+                process::exit(1);
+            }
+            Ok(_) => (),
+            Err(err) => {
+                eprintln!("redox_installer_tui: failed to read line: {}", err);
+                process::exit(1);
+            }
         }
 
-        if paths.is_empty() {
-            eprintln!("redox_installer_tui: no RedoxFS partition found");
-            eprintln!("redox_installer_tui: this tool is used to overwrite unmounted RedoxFS disk in Redox OS");
+        let typed = line.trim();
+        if typed.eq_ignore_ascii_case("q") {
+            eprintln!("redox_installer_tui: nothing was written; quitting at the operator's request");
             process::exit(1);
-        } else {
-            eprint!("Select a drive from 1 to {}: ", paths.len());
-
-            let mut line = String::new();
-            match io::stdin().read_line(&mut line) {
-                Ok(0) => {
-                    eprintln!("redox_installer_tui: failed to read line: end of input");
-                    process::exit(1);
-                }
-                Ok(_) => (),
-                Err(err) => {
-                    eprintln!("redox_installer_tui: failed to read line: {}", err);
-                    process::exit(1);
-                }
-            }
-
-            match line.trim().parse::<usize>() {
-                Ok(i) => {
-                    if i >= 1 && i <= paths.len() {
-                        break paths[i - 1].0.clone();
-                    } else {
-                        eprintln!("{} not from 1 to {}", i, paths.len());
-                    }
-                }
-                Err(err) => {
-                    eprintln!("invalid input: {}", err);
-                }
-            }
         }
+
+        if let Some((path, _)) = paths.iter().find(|(p, _)| confirms(typed, p)) {
+            break path.clone();
+        }
+
+        eprintln!();
+        eprintln!("refused: {:?} does not name any disk listed above. Nothing was written.", typed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interface_is_read_from_the_scheme_name() {
+        // The exact string two real runs produced.
+        let (iface, rem) = interface_of("disk.pci-0000-00-05.0-nvme");
+        assert_eq!(iface, "NVMe");
+        assert_eq!(rem, Removable::No);
+    }
+
+    #[test]
+    fn an_unmeasured_interface_is_reported_as_unknown_not_guessed() {
+        // The point of the test: we must NOT claim removability for a driver this code has
+        // never been run against. Saying "unknown" is the honest answer and is printed.
+        let (iface, rem) = interface_of("disk.pci-0000-00-1f.2-ahci");
+        assert_eq!(iface, "ahci");
+        assert_eq!(rem, Removable::Unknown);
+        assert!(rem.describe().contains("no removability flag"));
+    }
+
+    #[test]
+    fn scheme_dir_is_the_parent_not_the_partition() {
+        assert_eq!(
+            scheme_dir_of(Path::new("/scheme/disk.pci-0000-00-06.0-nvme/1")),
+            "disk.pci-0000-00-06.0-nvme"
+        );
+    }
+
+    #[test]
+    fn confirmation_needs_the_whole_path() {
+        let disk = Path::new("/scheme/disk.pci-0000-00-06.0-nvme/1");
+        assert!(confirms("/scheme/disk.pci-0000-00-06.0-nvme/1", disk));
+        assert!(confirms("  /scheme/disk.pci-0000-00-06.0-nvme/1\n", disk));
+    }
+
+    #[test]
+    fn a_near_miss_is_refused() {
+        // These two differ by ONE character, and both existed in real runs. A prefix match or a
+        // fuzzy compare would erase the wrong disk here.
+        let disk = Path::new("/scheme/disk.pci-0000-00-06.0-nvme/1");
+        assert!(!confirms("/scheme/disk.pci-0000-00-05.0-nvme/1", disk));
+        assert!(!confirms("/scheme/disk.pci-0000-00-06.0-nvme", disk));
+        // Refused deliberately. Rust's `Path` says this EQUALS the disk -- measured -- so the
+        // comparison is on strings; a confirmation prompt must not silently normalise.
+        assert!(!confirms("/scheme/disk.pci-0000-00-06.0-nvme/1/", disk));
+        assert!(!confirms("/scheme//disk.pci-0000-00-06.0-nvme/1", disk));
+        assert!(!confirms("1", disk));
+        assert!(!confirms("", disk));
+        assert!(!confirms("   ", disk));
     }
 }
 
