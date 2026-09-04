@@ -399,6 +399,50 @@ mod tests {
     }
 }
 
+/// Delete the applications the person declined from the freshly written target.
+///
+/// This exists because the FAST install path is a filesystem clone: it copies everything on the
+/// medium, declined applications included, and then returns. Honouring the answer therefore means
+/// a removal, and a removal needs the target mounted -- which is what `with_redoxfs_mount` is for.
+///
+/// A file the manifest names and the image does not have counts as ALREADY REMOVED. That is the
+/// state the person asked for, and it is not hypothetical: until 2026-09-03 no application icon
+/// reached the image at all, so every icon path in the manifest was exactly this case.
+fn remove_declined<D>(
+    fs: redoxfs::FileSystem<D>,
+    declined: &[redox_installer::optional::OptionalApp],
+) -> Result<()>
+where
+    D: redoxfs::Disk + Send + 'static,
+{
+    if declined.is_empty() {
+        return Ok(());
+    }
+    with_redoxfs_mount(fs, None, |mount_path| {
+        let refs: Vec<&redox_installer::optional::OptionalApp> = declined.iter().collect();
+        let removal = redox_installer::optional::remove(mount_path, &refs);
+        eprintln!(
+            "redox_installer_tui: optional applications: {} file(s) removed, {} already absent",
+            removal.removed.len(),
+            removal.absent.len()
+        );
+        for (path, why) in &removal.failed {
+            eprintln!("redox_installer_tui: could not remove {path}: {why}");
+        }
+        if !removal.is_clean() {
+            // A refusal the person cannot see is a refusal that did not happen. The install is
+            // otherwise complete, so this reports rather than unwinds -- but it reports loudly,
+            // and non-zero, because the system on the disk is not the one that was asked for.
+            return Err(io::Error::other(format!(
+                "{} declined file(s) could not be removed",
+                removal.failed.len()
+            ))
+            .into());
+        }
+        Ok(())
+    })
+}
+
 fn main() {
     let root_path = Path::new("/");
 
@@ -410,6 +454,43 @@ fn main() {
     ) else {
         process::exit(1);
     };
+
+    // OPTIONAL APPLICATIONS (E-OS PR-018). Asked HERE, next to the password, and deliberately
+    // not later: everything after this point writes to the disk, and a question asked after the
+    // erase is a question whose answer cannot change the outcome without a second pass.
+    //
+    // The manifest is read from the LIVE system -- the medium this installer is running from --
+    // because that is the thing whose contents are about to be cloned. An image that ships no
+    // manifest simply offers no choice; that is not an error, and the installer must still work.
+    let optional_apps = redox_installer::optional::read(Path::new(
+        redox_installer::optional::MANIFEST_PATH,
+    ))
+    .unwrap_or_default();
+    let declined_apps: Vec<redox_installer::optional::OptionalApp> = if optional_apps.is_empty() {
+        Vec::new()
+    } else {
+        let stdin = io::stdin();
+        let mut input = stdin.lock();
+        let mut out = io::stderr();
+        match redox_installer::optional::prompt(&optional_apps, &mut input, &mut out) {
+            Ok(indices) => indices.into_iter().map(|i| optional_apps[i].clone()).collect(),
+            Err(err) => {
+                // Keeping everything is the safe answer to a broken console.
+                eprintln!("redox_installer_tui: could not read the answer ({err}); keeping all");
+                Vec::new()
+            }
+        }
+    };
+    if !declined_apps.is_empty() {
+        eprintln!(
+            "redox_installer_tui: leaving out: {}",
+            declined_apps
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     let instant = std::time::Instant::now();
 
@@ -477,6 +558,10 @@ fn main() {
             }
         })? {
             eprintln!("\rfinished installing using fast mode");
+            // The clone copied EVERYTHING, including the applications the person declined, so
+            // honouring the answer means deleting them from the target now. This is the only
+            // point at which the fast path touches the installed filesystem after the clone.
+            remove_declined(fs, &declined_apps)?;
             return Ok(());
         }
 
@@ -510,6 +595,32 @@ fn main() {
                 let src = root_path.join(name);
                 let dest = mount_path.join(name);
                 copy_file(&src, &dest, &mut buf)?;
+            }
+
+            // The slow path copies file by file from the live root, so it installs the declined
+            // applications too -- `package_files` walks the package database, which does not know
+            // about this choice. Removing here, while the target is still mounted, keeps both
+            // install paths honouring the same answer; a toggle that worked only on the fast path
+            // would be a toggle that silently stopped working on older hardware.
+            if !declined_apps.is_empty() {
+                let refs: Vec<&redox_installer::optional::OptionalApp> =
+                    declined_apps.iter().collect();
+                let removal = redox_installer::optional::remove(mount_path, &refs);
+                eprintln!(
+                    "optional applications: {} file(s) removed, {} already absent",
+                    removal.removed.len(),
+                    removal.absent.len()
+                );
+                for (path, why) in &removal.failed {
+                    eprintln!("could not remove {path}: {why}");
+                }
+                if !removal.is_clean() {
+                    return Err(io::Error::other(format!(
+                        "{} declined file(s) could not be removed",
+                        removal.failed.len()
+                    ))
+                    .into());
+                }
             }
 
             eprintln!("finished installing, unmounting filesystem");
